@@ -1,5 +1,6 @@
 import asyncio
 import json
+import platform
 from fastapi import FastAPI, WebSocket, Request
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -19,6 +20,55 @@ app.add_middleware(
 # Przechowujemy aktywne połączenia WebRTC
 pcs = set()
 
+
+def create_video_player() -> MediaPlayer:
+    system = platform.system()
+
+    if system == "Darwin":
+        # macOS: avfoundation uses "video_index:audio_index"
+        return MediaPlayer(
+            "0:none",
+            format="avfoundation",
+            options={
+                "video_size": "1280x720",
+                "framerate": "30",
+            },
+        )
+
+    if system == "Windows":
+        return MediaPlayer(
+            "video=0",
+            format="dshow",
+            options={
+                "video_size": "1280x720",
+                "framerate": "30",
+            },
+        )
+
+    # Linux/other fallback (camera index 0)
+    return MediaPlayer(
+        "/dev/video0",
+        format="v4l2",
+        options={
+            "video_size": "1280x720",
+            "framerate": "30",
+        },
+    )
+
+
+def create_audio_player() -> MediaPlayer:
+    system = platform.system()
+
+    if system == "Darwin":
+        # macOS: "none:0" means first audio device only.
+        return MediaPlayer("none:0", format="avfoundation")
+
+    if system == "Windows":
+        return MediaPlayer("audio=Microphone Array (AMD Audio Device)", format="dshow")
+
+    # Linux/other fallback
+    return MediaPlayer("default", format="pulse")
+
 @app.post("/offer")
 async def offer(request: Request):
     params = await request.json()
@@ -36,10 +86,7 @@ async def offer(request: Request):
     # --- OBSŁUGA WIDEO ---
     try:
         # Próbujemy Twoją kamerę
-        video_player = MediaPlayer('video=HD User Facing', format='dshow', options={
-            "video_size": "1280x720",
-            "framerate": "30"
-        })
+        video_player = create_video_player()
         pc.addTrack(video_player.video)
         print("✅ Kamera podpięta!")
     except Exception as e:
@@ -49,9 +96,7 @@ async def offer(request: Request):
 
     # --- OBSŁUGA AUDIO (Zabezpieczona) ---
     try:
-        # Próbujemy mikrofon (AMD Audio Device)
-        # UWAGA: sprawdzamy, czy nazwa jest dokładnie taka jak w ffmpeg -list_devices
-        audio_player = MediaPlayer('audio=Microphone Array (AMD Audio Device)', format='dshow')
+        audio_player = create_audio_player()
         pc.addTrack(audio_player.audio)
         print("✅ Mikrofon podpięty!")
     except Exception as e:
