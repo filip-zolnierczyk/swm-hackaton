@@ -298,8 +298,8 @@ async def receive(ws):
                     except (TypeError, ValueError):
                         confidence = 0.0
 
-                    if confidence <= 0.49:
-                        print(f"⏭️ SKIP TILE (confidence={confidence:.2f} <= 0.49)")
+                    if confidence <= 0.50:
+                        print(f"⏭️ SKIP TILE (confidence={confidence:.2f} <= 0.50)")
                         pending_json = None
                         print("✅ TURN COMPLETE\n")
                         continue
