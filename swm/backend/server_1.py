@@ -2,10 +2,12 @@ import asyncio
 import websockets
 import json
 import base64
+import os
 import sounddevice as sd
 import re
 import threading
 import platform
+from pathlib import Path
 from fastapi import FastAPI, WebSocket, Request
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -19,7 +21,26 @@ from google.genai import types
 # ================================
 # 🔐 CONFIG
 # ================================
-API_KEY = "..."
+def load_local_env() -> None:
+    env_path = Path(__file__).resolve().parent / ".env"
+    if not env_path.exists():
+        return
+
+    for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        os.environ.setdefault(key, value)
+
+
+load_local_env()
+API_KEY = os.getenv("GEMINI_API_KEY", "")
+if not API_KEY:
+    raise RuntimeError("Brak GEMINI_API_KEY. Ustaw klucz w swm/backend/.env.")
+
 MODEL = "models/gemini-3.1-flash-live-preview"
 WS_URL = f"wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key={API_KEY}"
 RATE = 16000
@@ -32,6 +53,7 @@ app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -187,7 +209,12 @@ async def send_config(ws):
             "systemInstruction": {
                 "parts": [{
                     "text": """
-Jesteś systemem do weryfikacji faktów.
+Jesteś systemem do weryfikacji faktów. Wypowiedzi będą po polsku.
+Nie komentuj każdej wypowiedzi, tylko odpowiadaj na konkretne roszczenia (claims).
+Jeśli wypowiedź nie zawiera roszczenia, odpowiedz "uncertain" z obniżonym confidence.
+Jeśli roszczenie jest prawdziwe, odpowiedz "true". Jeśli fałszywe, odpowiedz "false".
+Jeśli prywatną opinię bardzo ciężko zweryfikować, odpowiedz "uncertain".
+Jeśli nie jesteś pewien czy dobrze oddasz o co chodziło, zmniejszyj swoją pewność (confidence).
 
 Zawsze odpowiadaj WYŁĄCZNIE poprawnym JSON-em:
 
@@ -265,6 +292,18 @@ async def receive(ws):
                 if pending_json:
                     print("\n✅ FACT CHECK RESULT:")
                     print(json.dumps(pending_json, indent=2, ensure_ascii=False))
+                    confidence = pending_json.get("confidence", 0)
+                    try:
+                        confidence = float(confidence)
+                    except (TypeError, ValueError):
+                        confidence = 0.0
+
+                    if confidence <= 0.49:
+                        print(f"⏭️ SKIP TILE (confidence={confidence:.2f} <= 0.49)")
+                        pending_json = None
+                        print("✅ TURN COMPLETE\n")
+                        continue
+
                     verdict_map = {
                         "true": "true",
                         "false": "false",
@@ -310,4 +349,4 @@ if __name__ == "__main__":
     def run_async():
         asyncio.run(main())
     threading.Thread(target=run_async, daemon=True).start()
-    uvicorn.run(app, host="127.0.0.1", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=8000)
