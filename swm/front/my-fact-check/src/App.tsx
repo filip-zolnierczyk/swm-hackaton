@@ -81,7 +81,7 @@ const App: React.FC = () => {
 
       socket.onopen = () => {
         console.log("✅ WebSocket Połączony!");
-        setConnectionStatus('Połączono');
+        setConnectionStatus('Connected');
         
         // Nie odpalamy strumienia automatycznie, czekamy na interakcję użytkownika
       };
@@ -126,7 +126,7 @@ const App: React.FC = () => {
         </div>
         <div className="header-info">
           <div className="addr-badge">ADDR: 127.0.0.1:8000</div>
-          <div className="status-text" style={{ color: connectionStatus === 'Połączono' ? '#16a34a' : '#dc2626' }}>
+          <div className="status-text" style={{ color: connectionStatus === 'Connected' ? '#16a34a' : '#dc2626' }}>
             Status: {connectionStatus}
           </div>
         </div>
@@ -138,7 +138,7 @@ const App: React.FC = () => {
         {/* OKNO WIDEO */}
         <div className="video-box">
           <video ref={videoRef} autoPlay playsInline muted={false} />
-          {!streamStarted && connectionStatus === 'Połączono' && (
+          {!streamStarted && connectionStatus === 'Connected' && (
             <button 
               className="start-stream-btn" 
               onClick={handleStartStream}
@@ -147,20 +147,13 @@ const App: React.FC = () => {
                 top: '50%',
                 left: '50%',
                 transform: 'translate(-50%, -50%)',
-                padding: '10px 20px',
-                fontSize: '16px',
-                backgroundColor: '#16a34a',
-                color: 'white',
-                border: 'none',
-                borderRadius: '5px',
-                cursor: 'pointer',
                 zIndex: 10
               }}
             >
               Start Stream
             </button>
           )}
-          {connectionStatus !== 'Połączono' && (
+          {connectionStatus !== 'Connected' && (
             <div className="waiting-overlay">Oczekiwanie na sygnał...</div>
           )}
         </div>
@@ -177,7 +170,7 @@ const App: React.FC = () => {
               >
                 <div className="card-header">
                   <span className="card-verdict">
-                    {item.status === 'true' ? '✓ Prawda' : item.status === 'false' ? '✗ Fałsz' : '⚠ Niejasne'}
+                    {item.status === 'true' ? '✓ True' : item.status === 'false' ? '✗ False' : '⚠ Mixed'}
                   </span>
                   <span className="card-live-label">LIVE</span>
                 </div>
