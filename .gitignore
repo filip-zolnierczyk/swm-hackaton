@@ -1,0 +1,8 @@
+swm/backend/__pycache__/server.cpython-313.pyc
+
+node_modules/
+dist/
+build/
+*.log
+*.pyc
+__pycache__/
