@@ -1,6 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react';
 import './index.css';
 
+// --- TYPY DANYCH ---
 interface FactCheck {
   id?: number;
   status: 'true' | 'false' | 'mixed';
@@ -13,27 +14,95 @@ const App: React.FC = () => {
   const [factChecks, setFactChecks] = useState<FactCheck[]>([]);
   const [connectionStatus, setConnectionStatus] = useState<string>('Inicjalizacja...');
 
+  // --- FUNKCJA TRANSMISJI WIDEO (WebRTC) ---
+  const startStreaming = async (videoElement: HTMLVideoElement) => {
+    try {
+      console.log("🚀 Inicjowanie WebRTC: Wysyłanie oferty do Pythona...");
+      const pc = new RTCPeerConnection();
+
+      // Odbieranie strumienia (wideo/audio) z Pythona
+      pc.ontrack = (event) => {
+      console.log(`📥 Otrzymano track: ${event.track.kind}`);
+      if (videoElement) {
+        // Jeśli wideo nie ma jeszcze obiektu stream, utwórz go
+        if (!videoElement.srcObject) {
+          videoElement.srcObject = new MediaStream();
+        }
+        // Dodaj przychodzący track (audio lub wideo) do naszego strumienia
+        const stream = videoElement.srcObject as MediaStream;
+        stream.addTrack(event.track);
+      }
+    };
+
+      // Deklarujemy, że chcemy tylko odbierać dane
+      pc.addTransceiver('video', { direction: 'recvonly' });
+      pc.addTransceiver('audio', { direction: 'recvonly' });
+
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+
+      // Wysyłamy ofertę SDP do endpointu /offer w Pythonie
+      const response = await fetch('http://127.0.0.1:8000/offer', {
+        method: 'POST',
+        body: JSON.stringify({
+          sdp: pc.localDescription?.sdp,
+          type: pc.localDescription?.type,
+        }),
+        headers: { 'Content-Type': 'application/json' }
+      });
+
+      if (!response.ok) throw new Error("Serwer Python odrzucił ofertę WebRTC");
+
+      const answer = await response.json();
+      await pc.setRemoteDescription(new RTCSessionDescription(answer));
+      console.log("✅ Połączenie WebRTC ustanowione!");
+    } catch (err) {
+      console.error("❌ Błąd WebRTC:", err);
+    }
+  };
+
+  // --- OBSŁUGA POŁĄCZENIA (WebSocket + Start Mediów) ---
   useEffect(() => {
     let socket: WebSocket | null = null;
     let reconnectTimeout: number;
 
     const connect = () => {
+      console.log("Próba połączenia z WebSocket...");
       socket = new WebSocket('ws://127.0.0.1:8000/ws');
-      socket.onopen = () => setConnectionStatus('Połączono');
+
+      socket.onopen = () => {
+        console.log("✅ WebSocket Połączony!");
+        setConnectionStatus('Połączono');
+        
+        // Gdy socket jest gotowy, odpalamy strumień wideo
+        if (videoRef.current) {
+          startStreaming(videoRef.current);
+        }
+      };
+
       socket.onmessage = (event) => {
         try {
           const data: FactCheck = JSON.parse(event.data);
+          // Dodajemy nowy fakt na górę listy
           setFactChecks(prev => [{ ...data, id: Date.now() }, ...prev]);
-        } catch (err) { console.error(err); }
+        } catch (err) {
+          console.error("Błąd parsowania danych kafelka:", err);
+        }
       };
-      socket.onerror = () => setConnectionStatus('Błąd połączenia');
+
+      socket.onerror = () => {
+        setConnectionStatus('Błąd połączenia');
+      };
+
       socket.onclose = () => {
+        console.log("🔌 Połączenie zamknięte. Reconnect za 2s...");
         setConnectionStatus('Rozłączono');
         reconnectTimeout = window.setTimeout(connect, 2000);
       };
     };
 
     connect();
+
     return () => {
       if (socket) socket.close();
       clearTimeout(reconnectTimeout);
@@ -43,6 +112,7 @@ const App: React.FC = () => {
   return (
     <div className="app-wrapper">
       
+      {/* NAGŁÓWEK */}
       <header className="main-header">
         <div>
           <h1 className="header-title">Fact-Check Live <span className="dot-live">●</span></h1>
@@ -56,15 +126,18 @@ const App: React.FC = () => {
         </div>
       </header>
 
+      {/* SEKCJA GŁÓWNA */}
       <main className="content-grid">
         
+        {/* OKNO WIDEO */}
         <div className="video-box">
-          <video ref={videoRef} autoPlay playsInline />
+          <video ref={videoRef} autoPlay playsInline muted={false} />
           {connectionStatus !== 'Połączono' && (
             <div className="waiting-overlay">Oczekiwanie na sygnał...</div>
           )}
         </div>
 
+        {/* PANEL KAFELKÓW */}
         <div className="fact-panel">
           {factChecks.length === 0 ? (
             <div className="no-data">No Data<br/>Detected</div>
