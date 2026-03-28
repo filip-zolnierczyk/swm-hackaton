@@ -1,313 +1,202 @@
-import asyncio
-import websockets
-import json
-import base64
-import sounddevice as sd
-import re
-import threading
-import platform
-from fastapi import FastAPI, WebSocket, Request
-from fastapi.responses import JSONResponse
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.websockets import WebSocketDisconnect
-from aiortc import RTCPeerConnection, RTCSessionDescription
-from aiortc.contrib.media import MediaPlayer, MediaRelay
-import uvicorn
+import React, { useEffect, useRef, useState } from 'react';
+import './index.css';
 
-from google.genai import types
-
-# ================================
-# 🔐 CONFIG
-# ================================
-API_KEY = "..."
-MODEL = "models/gemini-3.1-flash-live-preview"
-WS_URL = f"wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key={API_KEY}"
-RATE = 16000
-
-# ================================
-# 🌐 FASTAPI + WS + WebRTC
-# ================================
-app = FastAPI()
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# Przechowujemy aktywne połączenia WebRTC
-pcs = set()
-clients = []
-
-def create_video_player() -> MediaPlayer:
-    system = platform.system()
-
-    if system == "Darwin":
-        # macOS: avfoundation uses "video_index:audio_index"
-        return MediaPlayer(
-            "0:none",
-            format="avfoundation",
-            options={
-                "video_size": "1280x720",
-                "framerate": "30",
-            },
-        )
-
-    if system == "Windows":
-        return MediaPlayer(
-            "video=0",
-            format="dshow",
-            options={
-                "video_size": "1280x720",
-                "framerate": "30",
-            },
-        )
-
-    # Linux/other fallback (camera index 0)
-    return MediaPlayer(
-        "/dev/video0",
-        format="v4l2",
-        options={
-            "video_size": "1280x720",
-            "framerate": "30",
-        },
-    )
-
-
-def create_audio_player() -> MediaPlayer:
-    system = platform.system()
-
-    if system == "Darwin":
-        # macOS: "none:0" means first audio device only.
-        return MediaPlayer("none:0", format="avfoundation")
-
-    if system == "Windows":
-        return MediaPlayer("audio=Microphone Array (AMD Audio Device)", format="dshow")
-
-    # Linux/other fallback
-    return MediaPlayer("default", format="pulse")
-
-@app.post("/offer")
-async def offer(request: Request):
-    params = await request.json()
-    offer = RTCSessionDescription(sdp=params["sdp"], type=params["type"])
-
-    pc = RTCPeerConnection()
-    pcs.add(pc)
-
-    @pc.on("connectionstatechange")
-    async def on_connectionstatechange():
-        if pc.connectionState == "failed":
-            await pc.close()
-            pcs.discard(pc)
-
-    # --- OBSŁUGA WIDEO ---
-    try:
-        # Próbujemy Twoją kamerę
-        video_player = create_video_player()
-        pc.addTrack(video_player.video)
-        print("✅ Kamera podpięta!")
-    except Exception as e:
-        print(f"⚠️ Kamera padła, daję pasy testowe: {e}")
-        test_player = MediaPlayer('testsrc', format='lavfi', options={'size': '1280x720', 'rate': '30'})
-        pc.addTrack(test_player.video)
-
-    # --- OBSŁUGA AUDIO (Zabezpieczona) ---
-    try:
-        audio_player = create_audio_player()
-        pc.addTrack(audio_player.audio)
-        print("✅ Mikrofon podpięty!")
-    except Exception as e:
-        print(f"⚠️ Mikrofon nie działa ({e}). Wysyłam ciszę, żeby nie wywalić błędu.")
-        # Generujemy "ciszę", żeby WebRTC miało jakikolwiek track audio
-        null_audio = MediaPlayer('anullsrc', format='lavfi')
-        pc.addTrack(null_audio.audio)
-
-    # --- HANDSHAKE ---
-    await pc.setRemoteDescription(offer)
-    answer = await pc.createAnswer()
-    await pc.setLocalDescription(answer)
-
-    return JSONResponse({
-        "sdp": pc.localDescription.sdp,
-        "type": pc.localDescription.type
-    })
-
-@app.websocket("/ws")
-async def websocket_endpoint(ws: WebSocket):
-    await ws.accept()
-    clients.append(ws)
-    print("🌐 Frontend connected")
-
-    try:
-        while True:
-            await ws.receive_text()
-    except WebSocketDisconnect:
-        clients.remove(ws)
-        print("❌ Frontend disconnected")
-
-
-async def broadcast(data):
-    dead_clients = []
-
-    for client in clients:
-        try:
-            await client.send_json(data)
-        except:
-            dead_clients.append(client)
-
-    for dc in dead_clients:
-        clients.remove(dc)
-
-
-# ================================
-# 🎤 AUDIO
-# ================================
-audio_queue = asyncio.Queue()
-
-def audio_callback(indata, frames, time, status):
-    if status:
-        print("⚠️ Audio status:", status)
-    audio_bytes = (indata * 32767).astype("int16").tobytes()
-    asyncio.run_coroutine_threadsafe(audio_queue.put(audio_bytes), loop)
-
-
-# ================================
-# 🤖 GEMINI CONFIG
-# ================================
-grounding_tool = types.Tool(
-    google_search=types.GoogleSearch()
-)
-
-async def send_config(ws):
-    config = {
-        "setup": {
-            "model": MODEL,
-            "systemInstruction": {
-                "parts": [{
-                    "text": """
-Jesteś systemem do weryfikacji faktów.
-
-Zawsze odpowiadaj WYŁĄCZNIE poprawnym JSON-em:
-
-{
-  "claim": string,
-  "verdict": "true" | "false" | "uncertain",
-  "confidence": number (0-1),
-  "explanation": string
+// --- TYPY DANYCH ---
+interface FactCheck {
+  id?: number;
+  status: 'true' | 'false' | 'mixed';
+  quote: string;
+  analysis: string;
 }
 
-Nie dodawaj żadnego tekstu poza JSON.
-Bądź sceptyczny.
-"""
-                }]
-            },
-            "generationConfig": {
-                "responseModalities": ["AUDIO"]
-            },
-            "outputAudioTranscription": {}
-        }
+const App: React.FC = () => {
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const [factChecks, setFactChecks] = useState<FactCheck[]>([]);
+  const [connectionStatus, setConnectionStatus] = useState<string>('Inicjalizacja...');
+  const [streamStarted, setStreamStarted] = useState<boolean>(false);
+
+  // --- FUNKCJA ROZPOCZĘCIA STRUMIENIA ---
+  const handleStartStream = async () => {
+    if (videoRef.current && !streamStarted) {
+      setStreamStarted(true);
+      await startStreaming(videoRef.current);
     }
-    print("📤 Sending setup...")
-    await ws.send(json.dumps(config))
+  };
 
-async def send_audio(ws):
-    while True:
-        chunk = await audio_queue.get()
-        encoded = base64.b64encode(chunk).decode()
-        msg = {
-            "realtimeInput": {
-                "audio": {
-                    "data": encoded,
-                    "mimeType": "audio/pcm;rate=16000"
-                }
-            }
+  // --- FUNKCJA TRANSMISJI WIDEO (WebRTC) ---
+  const startStreaming = async (videoElement: HTMLVideoElement) => {
+    try {
+      console.log("🚀 Inicjowanie WebRTC: Wysyłanie oferty do Pythona...");
+      const pc = new RTCPeerConnection();
+
+      // Odbieranie strumienia (wideo/audio) z Pythona
+      pc.ontrack = (event) => {
+      console.log(`📥 Otrzymano track: ${event.track.kind}`);
+      if (videoElement) {
+        // Jeśli wideo nie ma jeszcze obiektu stream, utwórz go
+        if (!videoElement.srcObject) {
+          videoElement.srcObject = new MediaStream();
         }
-        await ws.send(json.dumps(msg))
+        // Dodaj przychodzący track (audio lub wideo) do naszego strumienia
+        const stream = videoElement.srcObject as MediaStream;
+        stream.addTrack(event.track);
+      }
+    };
 
+      // Deklarujemy, że chcemy tylko odbierać dane
+      pc.addTransceiver('video', { direction: 'recvonly' });
+      pc.addTransceiver('audio', { direction: 'recvonly' });
 
-# ================================
-# 🧠 JSON SAFE PARSER
-# ================================
-def safe_parse_json(text):
-    try:
-        return json.loads(text)
-    except:
-        match = re.search(r"\{.*\}", text, re.DOTALL)
-        if match:
-            try:
-                return json.loads(match.group(0))
-            except:
-                return None
-    return None
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
 
+      // Wysyłamy ofertę SDP do endpointu /offer w Pythonie
+      const response = await fetch('http://127.0.0.1:8000/offer', {
+        method: 'POST',
+        body: JSON.stringify({
+          sdp: pc.localDescription?.sdp,
+          type: pc.localDescription?.type,
+        }),
+        headers: { 'Content-Type': 'application/json' }
+      });
 
-# ================================
-# 📥 RECEIVE + BROADCAST
-# ================================
-async def receive(ws):
-    pending_json = None  # 🔥 trzymamy tylko finalny wynik
-    async for msg in ws:
-        data = json.loads(msg)
-        if "setupComplete" in data:
-            print("✅ SETUP COMPLETE")
-        if "serverContent" in data:
-            sc = data["serverContent"]
-            if "inputTranscription" in sc:
-                print("🧑 YOU:", sc["inputTranscription"]["text"])
-            if "outputTranscription" in sc:
-                raw = sc["outputTranscription"]["text"]
-                parsed = safe_parse_json(raw)
-                if parsed:
-                    pending_json = parsed  # 🔥 nadpisujemy (stream → final)
-            if sc.get("turnComplete"):
-                if pending_json:
-                    print("\n✅ FACT CHECK RESULT:")
-                    print(json.dumps(pending_json, indent=2, ensure_ascii=False))
-                    verdict_map = {
-                        "true": "true",
-                        "false": "false",
-                        "uncertain": "mixed"
-                    }
-                    payload = {
-                        "status": verdict_map.get(pending_json.get("verdict"), "mixed"),
-                        "quote": pending_json.get("claim", ""),
-                        "analysis": pending_json.get("explanation", "")
-                    }
-                    await broadcast(payload)
-                    pending_json = None  # 🔥 reset na kolejny turn
-                print("✅ TURN COMPLETE\n")
+      if (!response.ok) throw new Error("Serwer Python odrzucił ofertę WebRTC");
 
+      const answer = await response.json();
+      await pc.setRemoteDescription(new RTCSessionDescription(answer));
+      console.log("✅ Połączenie WebRTC ustanowione!");
+    } catch (err) {
+      console.error("❌ Błąd WebRTC:", err);
+    }
+  };
 
-# ================================
-# 🚀 GEMINI LOOP
-# ================================
-async def main():
-    global loop
-    loop = asyncio.get_event_loop()
-    print("🔌 Connecting to Gemini...")
-    async with websockets.connect(WS_URL) as ws:
-        print("✅ Connected to Gemini")
-        await send_config(ws)
-        stream = sd.InputStream(
-            samplerate=RATE,
-            channels=1,
-            callback=audio_callback
-        )
-        stream.start()
-        print("🎤 Mic started")
-        await asyncio.gather(
-            send_audio(ws),
-            receive(ws)
-        )
+  // --- OBSŁUGA POŁĄCZENIA (WebSocket + Start Mediów) ---
+  useEffect(() => {
+    let socket: WebSocket | null = null;
+    let reconnectTimeout: number;
 
+    const connect = () => {
+      console.log("Próba połączenia z WebSocket...");
+      socket = new WebSocket('ws://127.0.0.1:8000/ws');
 
-# ================================
-# ▶️ ENTRYPOINT
-# ================================
-if __name__ == "__main__":
-    def run_async():
-        asyncio.run(main())
-    threading.Thread(target=run_async, daemon=True).start()
-    uvicorn.run(app, host="127.0.0.1", port=8000)
+      socket.onopen = () => {
+        console.log("✅ WebSocket Połączony!");
+        setConnectionStatus('Połączono');
+        
+        // Nie odpalamy strumienia automatycznie, czekamy na interakcję użytkownika
+      };
+
+      socket.onmessage = (event) => {
+        try {
+          const data: FactCheck = JSON.parse(event.data);
+          // Dodajemy nowy fakt na górę listy
+          setFactChecks(prev => [{ ...data, id: Date.now() }, ...prev]);
+        } catch (err) {
+          console.error("Błąd parsowania danych kafelka:", err);
+        }
+      };
+
+      socket.onerror = () => {
+        setConnectionStatus('Błąd połączenia');
+      };
+
+      socket.onclose = () => {
+        console.log("🔌 Połączenie zamknięte. Reconnect za 2s...");
+        setConnectionStatus('Rozłączono');
+        reconnectTimeout = window.setTimeout(connect, 2000);
+      };
+    };
+
+    connect();
+
+    return () => {
+      if (socket) socket.close();
+      clearTimeout(reconnectTimeout);
+    };
+  }, []);
+
+  return (
+    <div className="app-wrapper">
+      
+      {/* NAGŁÓWEK */}
+      <header className="main-header">
+        <div>
+          <h1 className="header-title">Fact-Check Live <span className="dot-live">●</span></h1>
+          <p style={{ fontWeight: 'bold', textTransform: 'uppercase', color: '#4b5563', margin: 0 }}>Real-time Stream Analysis System</p>
+        </div>
+        <div className="header-info">
+          <div className="addr-badge">ADDR: 127.0.0.1:8000</div>
+          <div className="status-text" style={{ color: connectionStatus === 'Połączono' ? '#16a34a' : '#dc2626' }}>
+            Status: {connectionStatus}
+          </div>
+        </div>
+      </header>
+
+      {/* SEKCJA GŁÓWNA */}
+      <main className="content-grid">
+        
+        {/* OKNO WIDEO */}
+        <div className="video-box">
+          <video ref={videoRef} autoPlay playsInline muted={false} />
+          {!streamStarted && connectionStatus === 'Połączono' && (
+            <button 
+              className="start-stream-btn" 
+              onClick={handleStartStream}
+              style={{
+                position: 'absolute',
+                top: '50%',
+                left: '50%',
+                transform: 'translate(-50%, -50%)',
+                padding: '10px 20px',
+                fontSize: '16px',
+                backgroundColor: '#16a34a',
+                color: 'white',
+                border: 'none',
+                borderRadius: '5px',
+                cursor: 'pointer',
+                zIndex: 10
+              }}
+            >
+              Start Stream
+            </button>
+          )}
+          {connectionStatus !== 'Połączono' && (
+            <div className="waiting-overlay">Oczekiwanie na sygnał...</div>
+          )}
+        </div>
+
+        {/* PANEL KAFELKÓW */}
+        <div className="fact-panel">
+          {factChecks.length === 0 ? (
+            <div className="no-data">No Data<br/>Detected</div>
+          ) : (
+            factChecks.map((item) => (
+              <div 
+                key={item.id} 
+                className={`fact-card card-${item.status}`}
+              >
+                <div className="card-header">
+                  <span className="card-verdict">
+                    {item.status === 'true' ? '✓ Prawda' : item.status === 'false' ? '✗ Fałsz' : '⚠ Niejasne'}
+                  </span>
+                  <span className="card-live-label">LIVE</span>
+                </div>
+                <p className="card-quote">"{item.quote}"</p>
+                <div className="card-analysis-box">
+                    <p className="card-analysis-text">{item.analysis}</p>
+                </div>
+              </div>
+            ))
+          )}
+        </div>
+
+      </main>
+
+      <footer className="footer">
+        Engine: Python AI / WebRTC Stream / React Interface
+      </footer>
+    </div>
+  );
+};
+
+export default App;
