@@ -4,13 +4,9 @@
 
 ---
 
-## 🚀 Overview
+## 🏆 Awards
 
-**Fact-Check Live** is an intelligent, real-time audio analysis system that combines live media streaming with the power of generative AI.
-
-It listens to spoken content as it happens and instantly verifies claims, helping users detect misinformation on the fly.
-
-Designed for live broadcasts, podcasts, and online media, the system bridges the gap between real-time content consumption and trustworthy information.
+🥇 **Winner — Software Mansion × Gemini Hackathon**
 
 ---
 
@@ -22,9 +18,13 @@ https://youtu.be/k0s_N9Pg2qk
 
 ---
 
-## 🏆 Awards
+## 🚀 Overview
 
-🥇 **Winner — Software Mansion × Gemini Hackathon**
+**Fact-Check Live** is an intelligent, real-time audio analysis system that combines live media streaming with the power of generative AI.
+
+It listens to spoken content as it happens and instantly verifies claims, helping users detect misinformation on the fly.
+
+Designed for live broadcasts, podcasts, and online media, the system bridges the gap between real-time content consumption and trustworthy information.
 
 ---
 
