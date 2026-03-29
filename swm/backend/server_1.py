@@ -216,6 +216,7 @@ If the claim is true, respond with "true". If false, respond with "false".
 If it is a personal opinion that is very difficult to verify, respond with "uncertain".
 If you are not sure whether you fully understood the claim or it's very bungled up, lower your confidence.
 All JSON fields, including "claim", have to be in English.
+For territorial disputes, say "uncertain" and explain the different perspectives.
 
 Always respond ONLY with valid JSON:
 
