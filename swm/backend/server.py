@@ -18,10 +18,9 @@ import uvicorn
 
 from google.genai import types
 
-# ================================
-# 🔐 CONFIG
-# ================================
+
 def load_local_env() -> None:
+    # Load environment variables from .env file
     env_path = Path(__file__).resolve().parent / ".env"
     if not env_path.exists():
         return
@@ -39,15 +38,14 @@ def load_local_env() -> None:
 load_local_env()
 API_KEY = os.getenv("GEMINI_API_KEY", "")
 if not API_KEY:
-    raise RuntimeError("Brak GEMINI_API_KEY. Ustaw klucz w swm/backend/.env.")
+    raise RuntimeError("GEMINI_API_KEY not found. Set GEMINI_API_KEY in .env")
 
 MODEL = "models/gemini-3.1-flash-live-preview"
 WS_URL = f"wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key={API_KEY}"
 RATE = 16000
+SERVER_HOST = os.getenv("SERVER_HOST", "0.0.0.0")
+SERVER_PORT = int(os.getenv("SERVER_PORT", "8000"))
 
-# ================================
-# 🌐 FASTAPI + WS + WebRTC
-# ================================
 app = FastAPI()
 
 app.add_middleware(
@@ -58,11 +56,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Przechowujemy aktywne połączenia WebRTC
 pcs = set()
 clients = []
 
+
 def create_video_player() -> MediaPlayer:
+    # Platform-specific video capture setup
     system = platform.system()
 
     if system == "Darwin":
@@ -86,7 +85,7 @@ def create_video_player() -> MediaPlayer:
             },
         )
 
-    # Linux/other fallback (camera index 0)
+    # Linux/other fallback
     return MediaPlayer(
         "/dev/video0",
         format="v4l2",
@@ -98,10 +97,11 @@ def create_video_player() -> MediaPlayer:
 
 
 def create_audio_player() -> MediaPlayer:
+    # Platform-specific audio input setup
     system = platform.system()
 
     if system == "Darwin":
-        # macOS: "none:0" means first audio device only.
+        # macOS: "none:0" means first audio device only
         return MediaPlayer("none:0", format="avfoundation")
 
     if system == "Windows":
@@ -110,8 +110,10 @@ def create_audio_player() -> MediaPlayer:
     # Linux/other fallback
     return MediaPlayer("default", format="pulse")
 
+
 @app.post("/offer")
 async def offer(request: Request):
+    # WebRTC offer from frontend - establish peer connection
     params = await request.json()
     offer = RTCSessionDescription(sdp=params["sdp"], type=params["type"])
 
@@ -124,29 +126,26 @@ async def offer(request: Request):
             await pc.close()
             pcs.discard(pc)
 
-    # --- OBSŁUGA WIDEO ---
+    # Video track with fallback to test pattern
     try:
-        # Próbujemy Twoją kamerę
         video_player = create_video_player()
         pc.addTrack(video_player.video)
-        print("✅ Kamera podpięta!")
-    except Exception as e:
-        print(f"⚠️ Kamera padła, daję pasy testowe: {e}")
+        print("Video device connected")
+    except (OSError, RuntimeError, ValueError) as e:
+        print(f"Video device failed, using test pattern: {e}")
         test_player = MediaPlayer('testsrc', format='lavfi', options={'size': '1280x720', 'rate': '30'})
         pc.addTrack(test_player.video)
 
-    # --- OBSŁUGA AUDIO (Zabezpieczona) ---
+    # Audio track with fallback to silent track
     try:
         audio_player = create_audio_player()
         pc.addTrack(audio_player.audio)
-        print("✅ Mikrofon podpięty!")
-    except Exception as e:
-        print(f"⚠️ Mikrofon nie działa ({e}). Wysyłam ciszę, żeby nie wywalić błędu.")
-        # Generujemy "ciszę", żeby WebRTC miało jakikolwiek track audio
+        print("Audio device connected")
+    except (OSError, RuntimeError, ValueError) as e:
+        print(f"Audio device failed, using silent track: {e}")
         null_audio = MediaPlayer('anullsrc', format='lavfi')
         pc.addTrack(null_audio.audio)
 
-    # --- HANDSHAKE ---
     await pc.setRemoteDescription(offer)
     answer = await pc.createAnswer()
     await pc.setLocalDescription(answer)
@@ -156,53 +155,55 @@ async def offer(request: Request):
         "type": pc.localDescription.type
     })
 
+
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
+    # WebSocket connection for sending fact-check results to frontend
     await ws.accept()
     clients.append(ws)
-    print("🌐 Frontend connected")
+    print("Frontend connected")
 
     try:
         while True:
             await ws.receive_text()
     except WebSocketDisconnect:
         clients.remove(ws)
-        print("❌ Frontend disconnected")
+        print("Frontend disconnected")
 
 
 async def broadcast(data):
+    # Send fact-check result to all connected frontends
     dead_clients = []
 
     for client in clients:
         try:
             await client.send_json(data)
-        except:
+        except (RuntimeError, ConnectionError) as e:
+            print(f"Failed to send to client: {e}")
             dead_clients.append(client)
 
     for dc in dead_clients:
         clients.remove(dc)
 
 
-# ================================
-# 🎤 AUDIO
-# ================================
 audio_queue = asyncio.Queue()
 
+
 def audio_callback(indata, frames, time, status):
+    # Capture audio from system microphone and convert to PCM format
     if status:
-        print("⚠️ Audio status:", status)
+        print(f"Audio status: {status}")
     audio_bytes = (indata * 32767).astype("int16").tobytes()
     asyncio.run_coroutine_threadsafe(audio_queue.put(audio_bytes), loop)
 
 
-# ================================
-# 🤖 GEMINI CONFIG
-# ================================
 grounding_tool = types.Tool(
     google_search=types.GoogleSearch()
 )
 
+
 async def send_config(ws):
+    # Send Gemini API configuration for fact-checking
     config = {
         "setup": {
             "model": MODEL,
@@ -239,10 +240,12 @@ Be skeptical.
             "outputAudioTranscription": {}
         }
     }
-    print("📤 Sending setup...")
+    print("Sending Gemini config...")
     await ws.send(json.dumps(config))
 
+
 async def send_audio(ws):
+    # Stream audio from queue to Gemini API
     while True:
         chunk = await audio_queue.get()
         encoded = base64.b64encode(chunk).decode()
@@ -257,43 +260,41 @@ async def send_audio(ws):
         await ws.send(json.dumps(msg))
 
 
-# ================================
-# 🧠 JSON SAFE PARSER
-# ================================
 def safe_parse_json(text):
+    # Safely parse JSON from text, extracting if mixed with other content
     try:
         return json.loads(text)
-    except:
+    except (json.JSONDecodeError, ValueError):
         match = re.search(r"\{.*\}", text, re.DOTALL)
         if match:
             try:
                 return json.loads(match.group(0))
-            except:
+            except (json.JSONDecodeError, ValueError):
                 return None
     return None
 
 
-# ================================
-# 📥 RECEIVE + BROADCAST
-# ================================
 async def receive(ws):
-    pending_json = None  # 🔥 trzymamy tylko finalny wynik
+    # Receive fact-check results from Gemini and broadcast to frontend
+    pending_json = None
     async for msg in ws:
         data = json.loads(msg)
         if "setupComplete" in data:
-            print("✅ SETUP COMPLETE")
+            print("Gemini setup complete")
         if "serverContent" in data:
             sc = data["serverContent"]
             if "inputTranscription" in sc:
-                print("🧑 YOU:", sc["inputTranscription"]["text"])
+                # User's spoken input
+                print(f"Input: {sc['inputTranscription']['text']}")
             if "outputTranscription" in sc:
+                # Gemini's fact-check result
                 raw = sc["outputTranscription"]["text"]
                 parsed = safe_parse_json(raw)
                 if parsed:
-                    pending_json = parsed  # 🔥 nadpisujemy (stream → final)
+                    pending_json = parsed
             if sc.get("turnComplete"):
                 if pending_json:
-                    print("\n✅ FACT CHECK RESULT:")
+                    print("Fact-check result:")
                     print(json.dumps(pending_json, indent=2, ensure_ascii=False))
                     confidence = pending_json.get("confidence", 0)
                     try:
@@ -301,10 +302,11 @@ async def receive(ws):
                     except (TypeError, ValueError):
                         confidence = 0.0
 
+                    # Skip low-confidence results
                     if confidence <= 0.50:
-                        print(f"⏭️ SKIP TILE (confidence={confidence:.2f} <= 0.50)")
+                        print(f"Skipping low confidence result (confidence={confidence:.2f})")
                         pending_json = None
-                        print("✅ TURN COMPLETE\n")
+                        print("Turn complete")
                         continue
 
                     verdict_map = {
@@ -318,19 +320,17 @@ async def receive(ws):
                         "analysis": pending_json.get("explanation", "")
                     }
                     await broadcast(payload)
-                    pending_json = None  # 🔥 reset na kolejny turn
-                print("✅ TURN COMPLETE\n")
+                    pending_json = None
+                print("Turn complete")
 
 
-# ================================
-# 🚀 GEMINI LOOP
-# ================================
 async def main():
+    # Main loop: connect to Gemini, send audio, receive results
     global loop
     loop = asyncio.get_event_loop()
-    print("🔌 Connecting to Gemini...")
+    print("Connecting to Gemini...")
     async with websockets.connect(WS_URL) as ws:
-        print("✅ Connected to Gemini")
+        print("Connected to Gemini")
         await send_config(ws)
         stream = sd.InputStream(
             samplerate=RATE,
@@ -338,18 +338,17 @@ async def main():
             callback=audio_callback
         )
         stream.start()
-        print("🎤 Mic started")
+        print("Audio input started")
         await asyncio.gather(
             send_audio(ws),
             receive(ws)
         )
 
 
-# ================================
-# ▶️ ENTRYPOINT
-# ================================
 if __name__ == "__main__":
+    # Start Gemini connection thread and FastAPI server
     def run_async():
         asyncio.run(main())
     threading.Thread(target=run_async, daemon=True).start()
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    print(f"Starting server at {SERVER_HOST}:{SERVER_PORT}")
+    uvicorn.run(app, host=SERVER_HOST, port=SERVER_PORT)

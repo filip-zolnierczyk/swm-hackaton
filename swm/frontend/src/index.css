@@ -105,8 +105,8 @@ video {
   flex-direction: column;
   gap: 16px;
   overflow-y: auto;
-  width: 420px;  /* Zgodnie z Twoim kodem */
-  height: 720px; /* Zgodnie z Twoim kodem */
+  width: 420px;
+  height: 720px;
 
 }
 
