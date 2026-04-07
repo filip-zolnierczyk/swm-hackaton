@@ -15,8 +15,7 @@ from fastapi.websockets import WebSocketDisconnect
 from aiortc import RTCPeerConnection, RTCSessionDescription
 from aiortc.contrib.media import MediaPlayer, MediaRelay
 import uvicorn
-
-from google.genai import types
+import httpx
 
 
 def load_local_env() -> None:
@@ -40,11 +39,41 @@ API_KEY = os.getenv("GEMINI_API_KEY", "")
 if not API_KEY:
     raise RuntimeError("GEMINI_API_KEY not found. Set GEMINI_API_KEY in .env")
 
+# Live API model (used by the real-time WebSocket normal mode)
 MODEL = "models/gemini-3.1-flash-live-preview"
 WS_URL = f"wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key={API_KEY}"
+
+# REST model for thorough mode (generateContent + Google Search grounding)
+THOROUGH_MODEL = "gemini-2.5-flash"
+THOROUGH_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{THOROUGH_MODEL}:generateContent?key={API_KEY}"
+
 RATE = 16000
 SERVER_HOST = os.getenv("SERVER_HOST", "0.0.0.0")
 SERVER_PORT = int(os.getenv("SERVER_PORT", "8000"))
+
+# Shared system prompt used by both modes
+SYSTEM_PROMPT = """
+You are a fact-checking system. The statements will be in Polish.
+Do not comment on every statement—only respond to specific claims.
+If a statement does not contain a claim, respond with "uncertain" and a lower confidence.
+If the claim is true, respond with "true". If false, respond with "false".
+If it is a personal opinion that is very difficult to verify, respond with "uncertain".
+If you are not sure whether you fully understood the claim or it's very bungled up, lower your confidence.
+All JSON fields, including "claim", have to be in English.
+For territorial disputes, say "uncertain" and explain the different perspectives.
+
+Always respond ONLY with valid JSON:
+
+{
+"claim": string,
+"verdict": "true" | "false" | "uncertain",
+"confidence": number (0-1),
+"explanation": string
+}
+
+Do not add any text outside the JSON.
+Be skeptical.
+"""
 
 app = FastAPI()
 
@@ -186,6 +215,82 @@ async def broadcast(data):
         clients.remove(dc)
 
 
+async def thorough_fact_check(claim: str) -> dict | None:
+    # Send claim to generateContent REST API with Google Search grounding
+    payload = {
+        "systemInstruction": {
+            "parts": [{"text": SYSTEM_PROMPT}]
+        },
+        "contents": [{
+            "parts": [{"text": claim}]
+        }],
+        "tools": [{"google_search": {}}]
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.post(THOROUGH_URL, json=payload)
+            resp.raise_for_status()
+            data = resp.json()
+
+        raw_text = data["candidates"][0]["content"]["parts"][0]["text"]
+        print(f"Thorough raw response: {raw_text[:200]}")
+        parsed = safe_parse_json(raw_text)
+
+        sources = []
+        if "groundingMetadata" in data["candidates"][0]:
+            grounding = data["candidates"][0]["groundingMetadata"]
+            if "groundingAttributions" in grounding:
+                for attr in grounding["groundingAttributions"][:5]:
+                    url = attr.get("web", {}).get("uri", "")
+                    title = attr.get("web", {}).get("title", "")
+                    if url:
+                        sources.append({"title": title or url, "url": url})
+                    elif "segment" in attr and "text" in attr["segment"]:
+                        text = attr["segment"]["text"].strip()
+                        if text and len(text) > 5:
+                            sources.append({"text": text})
+            if not sources and "searchEntryPoint" in grounding:
+                rendered = grounding["searchEntryPoint"].get("renderedContent", "")
+                if rendered:
+                    sources.append({"html": rendered})
+
+        return {**parsed, "sources": sources} if parsed else None
+
+    except httpx.HTTPStatusError as e:
+        print(f"Thorough mode HTTP error {e.response.status_code}: {e.response.text}")
+        return None
+    except Exception as e:
+        print(f"Thorough mode error: {e}")
+        return None
+
+
+@app.post("/thorough")
+async def thorough_endpoint(request: Request):
+    # Receive claim, fact-check it, return response (do not broadcast)
+    body = await request.json()
+    claim = body.get("text", "").strip()
+
+    if not claim:
+        return JSONResponse({"error": "No text provided"}, status_code=400)
+
+    print(f"Thorough check requested: {claim[:100]}")
+    result = await thorough_fact_check(claim)
+
+    if not result:
+        return JSONResponse({"error": "Failed to parse Gemini response"}, status_code=500)
+
+    verdict_map = {"true": "true", "false": "false", "uncertain": "mixed"}
+    payload = {
+        "status": verdict_map.get(result.get("verdict"), "mixed"),
+        "quote": result.get("claim", claim),
+        "analysis": result.get("explanation", ""),
+        "sources": result.get("sources", [])
+    }
+
+    return JSONResponse(payload)
+
+
 audio_queue = asyncio.Queue()
 
 
@@ -197,42 +302,13 @@ def audio_callback(indata, frames, time, status):
     asyncio.run_coroutine_threadsafe(audio_queue.put(audio_bytes), loop)
 
 
-grounding_tool = types.Tool(
-    google_search=types.GoogleSearch()
-)
-
-
 async def send_config(ws):
-    # Send Gemini API configuration for fact-checking
+    # Send Gemini Live API configuration for fact-checking
     config = {
         "setup": {
             "model": MODEL,
             "systemInstruction": {
-                "parts": [{
-                    "text": """
-You are a fact-checking system. The statements will be in Polish.
-Do not comment on every statement—only respond to specific claims.
-If a statement does not contain a claim, respond with "uncertain" and a lower confidence.
-If the claim is true, respond with "true". If false, respond with "false".
-If it is a personal opinion that is very difficult to verify, respond with "uncertain".
-If you are not sure whether you fully understood the claim or it's very bungled up, lower your confidence.
-All JSON fields, including "claim", have to be in English.
-For territorial disputes, say "uncertain" and explain the different perspectives.
-
-Always respond ONLY with valid JSON:
-
-{
-"claim": string,
-"verdict": "true" | "false" | "uncertain",
-"confidence": number (0-1),
-"explanation": string
-}
-
-Do not add any text outside the JSON.
-Be skeptical.
-
-"""
-                }]
+                "parts": [{"text": SYSTEM_PROMPT}]
             },
             "generationConfig": {
                 "responseModalities": ["AUDIO"]

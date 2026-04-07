@@ -6,6 +6,8 @@ interface FactCheck {
   status: 'true' | 'false' | 'mixed';
   quote: string;
   analysis: string;
+  sources?: Array<{ title?: string; url?: string; text?: string; html?: string }>;
+  isLoading?: boolean;
 }
 
 // Load config from environment variables
@@ -17,11 +19,63 @@ const App: React.FC = () => {
   const [factChecks, setFactChecks] = useState<FactCheck[]>([]);
   const [connectionStatus, setConnectionStatus] = useState<string>('Initializing...');
   const [streamStarted, setStreamStarted] = useState<boolean>(false);
+  const [thoroughMode, setThoroughMode] = useState<boolean>(false);
 
   const handleStartStream = async () => {
     if (videoRef.current && !streamStarted) {
       setStreamStarted(true);
       await startStreaming(videoRef.current);
+    }
+  };
+
+  const handleThoroughModeToggle = (enabled: boolean) => {
+    setThoroughMode(enabled);
+    setFactChecks([]);
+  };
+
+  const fetchThoroughAnalysis = async (claim: string) => {
+    const loadingId = Date.now();
+    setFactChecks(prev => [{
+      id: loadingId,
+      status: 'mixed',
+      quote: claim,
+      analysis: '',
+      isLoading: true
+    }, ...prev]);
+
+    try {
+      const response = await fetch(`${API_HOST}/thorough`, {
+        method: 'POST',
+        body: JSON.stringify({ text: claim }),
+        headers: { 'Content-Type': 'application/json' }
+      });
+      if (response.ok) {
+        const result = await response.json();
+        setFactChecks(prev =>
+          prev.map(item =>
+            item.id === loadingId
+              ? { ...item, ...result, isLoading: false }
+              : item
+          )
+        );
+      } else {
+        setFactChecks(prev =>
+          prev.map(item =>
+            item.id === loadingId
+              ? { ...item, isLoading: false }
+              : item
+          )
+        );
+      }
+    } catch (err) {
+      console.error('Error fetching thorough analysis:', err);
+      setFactChecks(prev =>
+        prev.map(item =>
+          item.id === loadingId
+            ? { ...item, isLoading: false }
+            : item
+        )
+      );
     }
   };
 
@@ -77,7 +131,12 @@ const App: React.FC = () => {
       socket.onmessage = (event) => {
         try {
           const data: FactCheck = JSON.parse(event.data);
-          setFactChecks(prev => [{ ...data, id: Date.now() }, ...prev]);
+          if (!thoroughMode) {
+            const newCheck = { ...data, id: Date.now() };
+            setFactChecks(prev => [newCheck, ...prev]);
+          } else {
+            fetchThoroughAnalysis(data.quote);
+          }
         } catch (err) {
           console.error("Error parsing fact-check:", err);
         }
@@ -99,7 +158,7 @@ const App: React.FC = () => {
       if (socket) socket.close();
       clearTimeout(reconnectTimeout);
     };
-  }, []);
+  }, [thoroughMode]);
 
   return (
     <div className="app-wrapper">
@@ -113,12 +172,20 @@ const App: React.FC = () => {
           <div className="status-text" style={{ color: connectionStatus === 'Connected' ? '#16a34a' : '#dc2626' }}>
             Status: {connectionStatus}
           </div>
+          <label className="thorough-toggle">
+            <input
+              type="checkbox"
+              checked={thoroughMode}
+              onChange={(e) => handleThoroughModeToggle(e.target.checked)}
+            />
+            Thorough Mode
+          </label>
         </div>
       </header>
 
       <main className="content-grid">
         <div className="video-box">
-          <video ref={videoRef} autoPlay playsInline muted={false} />
+          <video ref={videoRef} autoPlay playsInline muted={true} />
           {!streamStarted && connectionStatus === 'Connected' && (
             <button
               className="start-stream-btn"
@@ -143,21 +210,51 @@ const App: React.FC = () => {
           {factChecks.length === 0 ? (
             <div className="no-data">No Data<br/>Detected</div>
           ) : (
-            factChecks.map((item) => (
+            factChecks
+              .filter(item => !thoroughMode || item.isLoading || item.analysis)
+              .map((item) => (
               <div
                 key={item.id}
-                className={`fact-card card-${item.status}`}
+                className={`fact-card card-${item.isLoading ? 'loading' : item.status}`}
               >
                 <div className="card-header">
                   <span className="card-verdict">
-                    {item.status === 'true' ? '✓ True' : item.status === 'false' ? '✗ False' : '⚠ Mixed'}
+                    {item.isLoading ? '⏳ Analyzing...' : item.status === 'true' ? '✓ True' : item.status === 'false' ? '✗ False' : '⚠ Mixed'}
                   </span>
                   <span className="card-live-label">LIVE</span>
                 </div>
                 <p className="card-quote">"{item.quote}"</p>
                 <div className="card-analysis-box">
-                  <p className="card-analysis-text">{item.analysis}</p>
+                  <p className="card-analysis-text">
+                    {item.isLoading ? 'Fetching thorough analysis with sources...' : item.analysis}
+                  </p>
                 </div>
+                {item.sources && item.sources.length > 0 && (
+                  <div className="card-sources">
+                    <p className="card-sources-label">Sources:</p>
+                    {item.sources.map((source, idx) => (
+                      source.html ? (
+                        <div
+                          key={idx}
+                          className="card-source-html"
+                          dangerouslySetInnerHTML={{ __html: source.html }}
+                        />
+                      ) : source.url ? (
+                        <a
+                          key={idx}
+                          href={source.url}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="card-source-link"
+                        >
+                          {source.title}
+                        </a>
+                      ) : (
+                        <p key={idx} className="card-source-text">{source.text}</p>
+                      )
+                    ))}
+                  </div>
+                )}
               </div>
             ))
           )}
