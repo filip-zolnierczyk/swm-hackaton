@@ -3,11 +3,12 @@ import './index.css';
 
 interface FactCheck {
   id?: number;
-  status: 'true' | 'false' | 'mixed';
+  status: 'true' | 'false' | 'mixed' | 'error';
   quote: string;
   analysis: string;
   sources?: Array<{ title?: string; url?: string; text?: string; html?: string }>;
   isLoading?: boolean;
+  isThorough?: boolean; // Mark thorough mode tiles
 }
 
 // Load config from environment variables
@@ -20,6 +21,7 @@ const App: React.FC = () => {
   const [connectionStatus, setConnectionStatus] = useState<string>('Initializing...');
   const [streamStarted, setStreamStarted] = useState<boolean>(false);
   const [thoroughMode, setThoroughMode] = useState<boolean>(false);
+  const recentClaimsRef = useRef<Map<string, number>>(new Map()); // Track recently checked claims with timestamp
 
   const handleStartStream = async () => {
     if (videoRef.current && !streamStarted) {
@@ -31,6 +33,7 @@ const App: React.FC = () => {
   const handleThoroughModeToggle = (enabled: boolean) => {
     setThoroughMode(enabled);
     setFactChecks([]);
+    recentClaimsRef.current.clear(); // Clear recent claims when switching modes
   };
 
   const fetchThoroughAnalysis = async (claim: string) => {
@@ -40,7 +43,8 @@ const App: React.FC = () => {
       status: 'mixed',
       quote: claim,
       analysis: '',
-      isLoading: true
+      isLoading: true,
+      isThorough: true
     }, ...prev]);
 
     try {
@@ -59,10 +63,12 @@ const App: React.FC = () => {
           )
         );
       } else {
+        // Error response - show error tile (purple)
+        const errorText = response.status === 429 ? 'Rate limit exceeded - thorough check failed' : 'Thorough check failed';
         setFactChecks(prev =>
           prev.map(item =>
             item.id === loadingId
-              ? { ...item, isLoading: false }
+              ? { ...item, status: 'error', analysis: errorText, isLoading: false }
               : item
           )
         );
@@ -72,7 +78,7 @@ const App: React.FC = () => {
       setFactChecks(prev =>
         prev.map(item =>
           item.id === loadingId
-            ? { ...item, isLoading: false }
+            ? { ...item, status: 'error', analysis: 'Error checking claim', isLoading: false }
             : item
         )
       );
@@ -131,10 +137,24 @@ const App: React.FC = () => {
       socket.onmessage = (event) => {
         try {
           const data: FactCheck = JSON.parse(event.data);
+          const normalizedClaim = data.quote.toLowerCase().trim();
+          const now = Date.now();
+          const FIVE_MINUTES = 5 * 60 * 1000;
+
+          console.log('Message received. Thorough mode:', thoroughMode, 'Data:', data);
+
           if (!thoroughMode) {
             const newCheck = { ...data, id: Date.now() };
             setFactChecks(prev => [newCheck, ...prev]);
           } else {
+            // Check if claim was recently verified (within 5 minutes)
+            const lastCheckTime = recentClaimsRef.current.get(normalizedClaim);
+            if (lastCheckTime && now - lastCheckTime < FIVE_MINUTES) {
+              console.log(`Skipping recent claim: ${data.quote}`);
+              return;
+            }
+            // Record this claim as checked
+            recentClaimsRef.current.set(normalizedClaim, now);
             fetchThoroughAnalysis(data.quote);
           }
         } catch (err) {
@@ -211,7 +231,7 @@ const App: React.FC = () => {
             <div className="no-data">No Data<br/>Detected</div>
           ) : (
             factChecks
-              .filter(item => !thoroughMode || item.isLoading || item.analysis)
+              .filter(item => thoroughMode ? item.isThorough : !item.isThorough)
               .map((item) => (
               <div
                 key={item.id}
@@ -219,7 +239,7 @@ const App: React.FC = () => {
               >
                 <div className="card-header">
                   <span className="card-verdict">
-                    {item.isLoading ? '⏳ Analyzing...' : item.status === 'true' ? '✓ True' : item.status === 'false' ? '✗ False' : '⚠ Mixed'}
+                    {item.isLoading ? '⏳ Analyzing...' : item.status === 'true' ? '✓ True' : item.status === 'false' ? '✗ False' : item.status === 'error' ? '⚠ Error' : '⚠ Mixed'}
                   </span>
                   <span className="card-live-label">LIVE</span>
                 </div>

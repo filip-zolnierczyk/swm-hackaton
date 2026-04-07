@@ -152,6 +152,7 @@ video {
 .card-true { background-color: #4ade80; }
 .card-false { background-color: #ef4444; }
 .card-mixed { background-color: #fde047; }
+.card-error { background-color: #c084fc; }
 .card-loading { background-color: #d1d5db; }
 
 .card-header {
