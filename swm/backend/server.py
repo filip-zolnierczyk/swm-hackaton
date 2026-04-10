@@ -51,14 +51,16 @@ RATE = 16000
 SERVER_HOST = os.getenv("SERVER_HOST", "0.0.0.0")
 SERVER_PORT = int(os.getenv("SERVER_PORT", "8000"))
 
-# Shared system prompt used by both modes
+# System prompt for normal mode (single claim per response)
 SYSTEM_PROMPT = """
 You are a fact-checking system that responds in English only.
-Do not comment on every statement—only respond to specific claims.
-If a statement does not contain a claim, respond with "uncertain" and a lower confidence.
+Respond to specific claims made in the conversation.
+Be aggressive in identifying verifiable claims and checking them - you don't have to wait until a person has stopped talking to respond.
+You must respond in the middle of a person's statement if you identify a claim that can be checked.
+If a statement does not contain a verifiable claim, respond with "uncertain" and lower confidence.
 If the claim is true, respond with "true". If false, respond with "false".
 If it is a personal opinion that is very difficult to verify, respond with "uncertain".
-If you are not sure whether you fully understood the claim or it's very bungled up, lower your confidence.
+If you are not sure whether you fully understood the claim, lower your confidence.
 All JSON fields must be in English.
 For territorial disputes, say "uncertain" and explain the different perspectives.
 
@@ -72,7 +74,34 @@ Always respond ONLY with valid JSON:
 }
 
 Do not add any text outside the JSON.
-Be skeptical.
+Be skeptical. Check claims concisely.
+"""
+
+# System prompt for thorough mode (extract and check multiple claims)
+THOROUGH_SYSTEM_PROMPT = """
+You are a fact-checking system that responds in English only.
+Extract ALL verifiable claims from the given text and fact-check each one.
+If the text contains multiple claims, return an array with one entry per claim.
+Do not comment on every statement—only extract claims that are verifiable.
+If a claim is true, respond with "true". If false, respond with "false".
+If it is a personal opinion or very difficult to verify, respond with "uncertain".
+All JSON fields must be in English.
+For territorial disputes, say "uncertain" and explain the different perspectives.
+
+Always respond ONLY with valid JSON as an array:
+
+[
+{
+"claim": string,
+"verdict": "true" | "false" | "uncertain",
+"confidence": number (0-1),
+"explanation": string
+}
+]
+
+Return an empty array [] if there are no verifiable claims.
+Do not add any text outside the JSON.
+Be skeptical and extract all claimable statements, even partial ones.
 """
 
 app = FastAPI()
@@ -215,11 +244,12 @@ async def broadcast(data):
         clients.remove(dc)
 
 
-async def thorough_fact_check(claim: str) -> dict | None:
+async def thorough_fact_check(claim: str) -> list[dict] | None:
     # Send claim to generateContent REST API with Google Search grounding
+    # Returns a list of fact-checks (one per extracted claim)
     payload = {
         "systemInstruction": {
-            "parts": [{"text": SYSTEM_PROMPT}]
+            "parts": [{"text": THOROUGH_SYSTEM_PROMPT}]
         },
         "contents": [{
             "parts": [{"text": claim}]
@@ -237,6 +267,14 @@ async def thorough_fact_check(claim: str) -> dict | None:
         print(f"Thorough raw response: {raw_text[:200]}")
         parsed = safe_parse_json(raw_text)
 
+        # Ensure parsed is a list
+        if not isinstance(parsed, list):
+            if isinstance(parsed, dict):
+                parsed = [parsed]
+            else:
+                return None
+
+        # Extract sources from grounding metadata (same for all claims)
         sources = []
         if "groundingMetadata" in data["candidates"][0]:
             grounding = data["candidates"][0]["groundingMetadata"]
@@ -255,7 +293,8 @@ async def thorough_fact_check(claim: str) -> dict | None:
                 if rendered:
                     sources.append({"html": rendered})
 
-        return {**parsed, "sources": sources} if parsed else None
+        # Attach sources to each claim
+        return [{**item, "sources": sources} for item in parsed]
 
     except httpx.HTTPStatusError as e:
         print(f"Thorough mode HTTP error {e.response.status_code}: {e.response.text}")
@@ -275,20 +314,26 @@ async def thorough_endpoint(request: Request):
         return JSONResponse({"error": "No text provided"}, status_code=400)
 
     print(f"Thorough check requested: {claim[:100]}")
-    result = await thorough_fact_check(claim)
+    results = await thorough_fact_check(claim)
 
-    if not result:
+    if not results:
         return JSONResponse({"error": "Failed to parse Gemini response"}, status_code=500)
 
     verdict_map = {"true": "true", "false": "false", "uncertain": "mixed"}
-    payload = {
-        "status": verdict_map.get(result.get("verdict"), "mixed"),
-        "quote": result.get("claim", claim),
-        "analysis": result.get("explanation", ""),
-        "sources": result.get("sources", [])
-    }
 
-    return JSONResponse(payload)
+    # Convert all results to payload format and return as array
+    payloads = [
+        {
+            "status": verdict_map.get(result.get("verdict"), "mixed"),
+            "quote": result.get("claim", claim),
+            "analysis": result.get("explanation", ""),
+            "sources": result.get("sources", [])
+        }
+        for result in results
+    ]
+
+    # If single result, return as object for backwards compatibility; otherwise array
+    return JSONResponse(payloads if len(payloads) > 1 else payloads[0])
 
 
 audio_queue = asyncio.Queue()
@@ -338,10 +383,12 @@ async def send_audio(ws):
 
 def safe_parse_json(text):
     # Safely parse JSON from text, extracting if mixed with other content
+    # Handles both objects {} and arrays []
     try:
         return json.loads(text)
     except (json.JSONDecodeError, ValueError):
-        match = re.search(r"\{.*\}", text, re.DOTALL)
+        # Try to match either array or object pattern
+        match = re.search(r"\[.*\]|\{.*\}", text, re.DOTALL)
         if match:
             try:
                 return json.loads(match.group(0))
@@ -370,32 +417,34 @@ async def receive(ws):
                     pending_json = parsed
             if sc.get("turnComplete"):
                 if pending_json:
-                    print("Fact-check result:")
-                    print(json.dumps(pending_json, indent=2, ensure_ascii=False))
-                    confidence = pending_json.get("confidence", 0)
-                    try:
-                        confidence = float(confidence)
-                    except (TypeError, ValueError):
-                        confidence = 0.0
+                    # Handle both single object and array responses
+                    results = pending_json if isinstance(pending_json, list) else [pending_json]
 
-                    # Skip low-confidence results
-                    if confidence <= 0.50:
-                        print(f"Skipping low confidence result (confidence={confidence:.2f})")
-                        pending_json = None
-                        print("Turn complete")
-                        continue
+                    for result in results:
+                        print("Fact-check result:")
+                        print(json.dumps(result, indent=2, ensure_ascii=False))
+                        confidence = result.get("confidence", 0)
+                        try:
+                            confidence = float(confidence)
+                        except (TypeError, ValueError):
+                            confidence = 0.0
 
-                    verdict_map = {
-                        "true": "true",
-                        "false": "false",
-                        "uncertain": "mixed"
-                    }
-                    payload = {
-                        "status": verdict_map.get(pending_json.get("verdict"), "mixed"),
-                        "quote": pending_json.get("claim", ""),
-                        "analysis": pending_json.get("explanation", "")
-                    }
-                    await broadcast(payload)
+                        # Skip low-confidence results
+                        if confidence <= 0.50:
+                            print(f"Skipping low confidence result (confidence={confidence:.2f})")
+                            continue
+
+                        verdict_map = {
+                            "true": "true",
+                            "false": "false",
+                            "uncertain": "mixed"
+                        }
+                        payload = {
+                            "status": verdict_map.get(result.get("verdict"), "mixed"),
+                            "quote": result.get("claim", ""),
+                            "analysis": result.get("explanation", "")
+                        }
+                        await broadcast(payload)
                     pending_json = None
                 print("Turn complete")
 
